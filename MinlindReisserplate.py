@@ -130,7 +130,10 @@ def run_example():
     coords, elems = build_mesh(nx, ny, Lx, Ly)
 
     def run_case(use_membrane, use_bending, use_shear, label):
-        K, F = assemble(coords, elems, t, E, nu, q, use_membrane=use_membrane, use_bending=use_bending, use_shear=use_shear)
+        K, F = assemble(coords, elems, t, E, nu, q, 
+                        use_membrane=use_membrane, 
+                        use_bending=use_bending, 
+                        use_shear=use_shear)
         # if membrane disabled, drop u(0) and v(1) DOFs from active set to avoid singular stiffness
         ndof = coords.shape[0] * 5
         if not use_membrane:
@@ -140,7 +143,39 @@ def run_example():
             K_red, F_red, free, fixed = apply_clamped_bc(K, F, coords, active_dofs=mask)
         else:
             K_red, F_red, free, fixed = apply_clamped_bc(K, F, coords)
-        U_red = solve_system(K_red, F_red)
+        # If membrane disabled, the reduced stiffness can be singular. Apply tiny diagonal regularization
+        # and retry solves if NaNs appear.
+        def try_solve_with_regularization(Kmat, Fvec, max_tries=3):
+            Kcur = Kmat.tocsr()
+            # estimate matrix scale
+            try:
+                mscale = float(np.max(np.abs(Kcur.data)))
+            except Exception:
+                mscale = 0.0
+            eps = max(mscale * 1e-12, 1e-16)
+            for attempt in range(max_tries):
+                if attempt > 0:
+                    # increase regularization if previous attempt produced NaNs
+                    eps *= 100.0
+                if eps > 0.0:
+                    Kreg = Kcur + sp.eye(Kcur.shape[0], format='csr') * eps
+                else:
+                    Kreg = Kcur
+                try:
+                    U = solve_system(Kreg, Fvec)
+                except Exception:
+                    U = None
+                if U is None or (isinstance(U, np.ndarray) and np.isnan(U).any()):
+                    # try again with larger eps
+                    continue
+                return U
+            # final attempt without regularization (will raise or return NaNs)
+            try:
+                return solve_system(Kcur, Fvec)
+            except Exception:
+                return np.full(Fvec.shape, np.nan)
+
+        U_red = try_solve_with_regularization(K_red, F_red)
         ndof = coords.shape[0] * 5
         U = np.zeros(ndof)
         U[free] = U_red
@@ -158,7 +193,10 @@ def run_example():
     print(f'  FEM model           : {w_full:.6e}')
 
     # return last solution's w field for plotting (re-run full to get w array)
-    K, F = assemble(coords, elems, t, E, nu, q, use_membrane=True, use_bending=True, use_shear=True)
+    K, F = assemble(coords, elems, t, E, nu, q, 
+                    use_membrane=True, 
+                    use_bending=True, 
+                    use_shear=True)
     K_red, F_red, free, fixed = apply_clamped_bc(K, F, coords)
     U_red = solve_system(K_red, F_red)
     ndof = coords.shape[0] * 5
@@ -200,11 +238,33 @@ def plot_with_pyvista(coords, elems, w, show=True, screenshot=None):
             p.camera.SetParallelProjection(True)
         except Exception:
             pass
-    p.add_mesh(mesh, scalars='deflection', 
+    # Create a refined/smoothed copy for plotting to emulate Abaqus contour smoothing
+    try:
+        # subdivide for denser sampling and interpolate scalars onto the refined mesh
+        mesh_ref = mesh.subdivide(2, 'linear')
+        mesh_ref.point_data['deflection'] = mesh.interpolate(mesh_ref)['deflection']
+        # optional Laplacian smoothing to further mimic Abaqus postprocessing
+        mesh_ref = mesh_ref.smooth(n_iter=20)
+        use_mesh = mesh_ref
+    except Exception:
+        use_mesh = mesh
+
+    actor = p.add_mesh(use_mesh, scalars='deflection', 
                cmap='jet', 
                show_edges=True, 
                show_scalar_bar=False,
-               interpolate_before_map=True)
+               interpolate_before_map=True,
+               smooth_shading=True)
+    # Ensure VTK mapper interpolation flag is set (works across PyVista versions)
+    try:
+        # PyVista returns a vtkActor with a mapper
+        actor.mapper.SetInterpolateScalarsBeforeMapping(True)
+    except Exception:
+        try:
+            # Fallback: get mapper via GetMapper()
+            actor.GetMapper().SetInterpolateScalarsBeforeMapping(True)
+        except Exception:
+            pass
     # place vertical scalar bar at top-left
     p.add_scalar_bar(title='deflection (m)', vertical=True, position_x=0.035, position_y=0.32, width=0.08, height=0.35)
     if screenshot:
